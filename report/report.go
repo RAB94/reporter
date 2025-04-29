@@ -18,8 +18,8 @@ package report
 
 import (
 	"fmt"
+	"hash/fnv"
 	"io"
-        "hash/fnv"
 	"log"
 	"os"
 	"os/exec"
@@ -31,7 +31,7 @@ import (
 	"github.com/pborman/uuid"
 )
 
-// Report groups functions related to genrating the report.
+// Report groups functions related to generating the report.
 // After reading and closing the pdf returned by Generate(), call Clean() to delete the pdf file as well the temporary build files
 type Report interface {
 	Generate() (pdf io.ReadCloser, err error)
@@ -40,13 +40,13 @@ type Report interface {
 }
 
 type report struct {
-    gClient      grafana.Client
-    time         grafana.TimeRange
-    texTemplate  string
-    dashName     string
-    tmpDir       string
-    dashTitle    string
-    UseRowLayout bool 
+	gClient      grafana.Client
+	time         grafana.TimeRange
+	texTemplate  string
+	dashName     string
+	tmpDir       string
+	dashTitle    string
+	useRowLayout bool
 }
 
 const (
@@ -58,54 +58,50 @@ const (
 // New creates a new Report.
 // texTemplate is the content of a LaTex template file. If empty, a default tex template is used.
 func New(g grafana.Client, dashName string, time grafana.TimeRange, texTemplate string, useRowLayout bool) Report {
-    return new(g, dashName, time, texTemplate, useRowLayout) // Pass the flag
+	return new(g, dashName, time, texTemplate, useRowLayout)
 }
 
-func new(g grafana.Client, dashName string, time grafana.TimeRange, texTemplate string, useRowLayout bool) *report { // Receive the flag
-    if texTemplate == "" {
-         // Decide default template based on layout type
-         if useRowLayout {
-             // Maybe use the original default template or a new one for rows?
-             texTemplate = defaultTemplate
-         } else {
-             // Use the grid template if not doing row layout (original behaviour)
-             texTemplate = defaultGridTemplate
-         }
-    }
-    tmpDir := filepath.Join("tmp", uuid.New())
-    // Store the flag in the struct field
-    return &report{g, time, texTemplate, dashName, tmpDir, "", useRowLayout} // <-- Assign to the new field
+func new(g grafana.Client, dashName string, time grafana.TimeRange, texTemplate string, useRowLayout bool) *report {
+	if texTemplate == "" {
+		if useRowLayout {
+			texTemplate = rowBasedTemplate
+		} else {
+			texTemplate = defaultTemplate
+		}
+	}
+	tmpDir := filepath.Join("tmp", uuid.New())
+	return &report{g, time, texTemplate, dashName, tmpDir, "", useRowLayout}
 }
 
-// Generate returns the report.pdf file.  After reading this file it should be Closed()
+// Generate returns the report.pdf file. After reading this file it should be Closed()
 // After closing the file, call report.Clean() to delete the file as well the temporary build files
 func (rep *report) Generate() (pdf io.ReadCloser, err error) {
-    dash, err := rep.gClient.GetDashboard(rep.dashName)
-    if err != nil {
-        err = fmt.Errorf("error fetching dashboard %v: %v", rep.dashName, err)
-        return
-    }
-    rep.dashTitle = dash.Title
+	dash, err := rep.gClient.GetDashboard(rep.dashName)
+	if err != nil {
+		err = fmt.Errorf("error fetching dashboard %v: %v", rep.dashName, err)
+		return
+	}
+	rep.dashTitle = dash.Title
 
-    if rep.UseRowLayout { // <--- Use the struct field
-    // Use row-based rendering
-        err = rep.renderRows(dash)
-    } else {
-    // Use panel-based rendering (existing method)
-        err = rep.renderPNGsParallel(dash)
-    }
-    
-    if err != nil {
-        return nil, err
-    }
-    
-    err = rep.generateTeXFile(dash)
-    if err != nil {
-        err = fmt.Errorf("error generating TeX file for dash %+v: %v", dash, err)
-        return
-    }
-    pdf, err = rep.runLaTeX()
-    return
+	if rep.useRowLayout {
+		// Use row-based rendering
+		err = rep.renderRowsSeparately(dash)
+	} else {
+		// Use panel-based rendering (existing method)
+		err = rep.renderPNGsParallel(dash)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	err = rep.generateTeXFile(dash)
+	if err != nil {
+		err = fmt.Errorf("error generating TeX file for dash %+v: %v", dash, err)
+		return
+	}
+	pdf, err = rep.runLaTeX()
+	return
 }
 
 // Title returns the dashboard title parsed from the dashboard definition
@@ -149,7 +145,7 @@ func (rep *report) renderPNGsParallel(dash grafana.Dashboard) error {
 	}
 	close(panels)
 
-	//fetch images in parrallel form Grafana sever.
+	//fetch images in parallel from Grafana server.
 	//limit concurrency using a worker pool to avoid overwhelming grafana
 	//for dashboards with many panels.
 	var wg sync.WaitGroup
@@ -204,11 +200,60 @@ func (rep *report) renderPNG(p grafana.Panel) error {
 	return nil
 }
 
+// renderRowsSeparately captures each row section individually as a separate image
+func (rep *report) renderRowsSeparately(dash grafana.Dashboard) error {
+	rows := dash.GetRows()
+	log.Printf("Rendering %d dashboard rows separately", len(rows))
+
+	err := os.MkdirAll(rep.imgDirPath(), 0777)
+	if err != nil {
+		return fmt.Errorf("error creating img directory: %v", err)
+	}
+
+	// Process each row in sequence to ensure proper scrolling/positioning
+	for i, row := range rows {
+		log.Printf("Rendering row %d: %s", i, row.Title)
+		
+		// Get the image for this specific row position
+		body, err := rep.gClient.GetRowPng(row, rep.dashName, rep.time, i)
+		if err != nil {
+			return fmt.Errorf("error getting row %d '%s': %v", i, row.Title, err)
+		}
+		
+		// Use row ID or a hash of the title if ID is not available
+		rowID := row.Id
+		if rowID <= 0 {
+			// Create a hash of the title to use as an identifier
+			h := fnv.New32a()
+			h.Write([]byte(row.Title))
+			rowID = int(h.Sum32())
+		}
+		
+		imgFileName := fmt.Sprintf("row%d.png", rowID)
+		log.Printf("Saving row image to %s", imgFileName)
+		
+		file, err := os.Create(filepath.Join(rep.imgDirPath(), imgFileName))
+		if err != nil {
+			return fmt.Errorf("error creating image file: %v", err)
+		}
+		
+		_, err = io.Copy(file, body)
+		file.Close()
+		body.Close()
+		
+		if err != nil {
+			return fmt.Errorf("error copying body to file: %v", err)
+		}
+	}
+	
+	return nil
+}
+
 func (rep *report) generateTeXFile(dash grafana.Dashboard) error {
 	type templData struct {
 		grafana.Dashboard
 		grafana.TimeRange
-		grafana.Client
+		UseRowLayout bool
 	}
 
 	err := os.MkdirAll(rep.tmpDir, 0777)
@@ -225,7 +270,7 @@ func (rep *report) generateTeXFile(dash grafana.Dashboard) error {
 	if err != nil {
 		return fmt.Errorf("error parsing template '%s': %v", rep.texTemplate, err)
 	}
-	data := templData{dash, rep.time, rep.gClient}
+	data := templData{dash, rep.time, rep.useRowLayout}
 	err = tmpl.Execute(file, data)
 	if err != nil {
 		return fmt.Errorf("error executing tex template:%v", err)
@@ -252,81 +297,4 @@ func (rep *report) runLaTeX() (pdf *os.File, err error) {
 	}
 	pdf, err = os.Open(rep.pdfPath())
 	return
-}
-
-
-// renderRows fetches row screenshots and saves them as images
-func (rep *report) renderRows(dash grafana.Dashboard) error {
-    rows := dash.GetRows()
-    
-    // Create a channel to process rows
-    rowChan := make(chan grafana.Row, len(rows))
-    for _, row := range rows {
-        rowChan <- row
-    }
-    close(rowChan)
-    
-    // Process rows in parallel with a worker pool
-    var wg sync.WaitGroup
-    workers := 3  // Fewer workers as row renders are more resource-intensive
-    wg.Add(workers)
-    errs := make(chan error, len(rows))
-    
-    for i := 0; i < workers; i++ {
-        go func(rows <-chan grafana.Row, errs chan<- error) {
-            defer wg.Done()
-            for row := range rows {
-                err := rep.renderRow(row)
-                if err != nil {
-                    log.Printf("Error creating image for row: %v", err)
-                    errs <- err
-                }
-            }
-        }(rowChan, errs)
-    }
-    wg.Wait()
-    close(errs)
-    
-    for err := range errs {
-        if err != nil {
-            return err
-        }
-    }
-    return nil
-}
-
-// renderRow fetches and saves a single row image
-func (rep *report) renderRow(row grafana.Row) error {
-    body, err := rep.gClient.GetRowPng(row, rep.dashName, rep.time)
-    if err != nil {
-        return fmt.Errorf("error getting row %s: %v", row.Title, err)
-    }
-    defer body.Close()
-    
-    err = os.MkdirAll(rep.imgDirPath(), 0777)
-    if err != nil {
-        return fmt.Errorf("error creating img directory: %v", err)
-    }
-    
-    // Use row ID or a hash of the title if ID is not available
-    rowID := row.Id
-    if rowID <= 0 {
-        // Create a hash of the title to use as an identifier
-        h := fnv.New32a()
-        h.Write([]byte(row.Title))
-        rowID = int(h.Sum32())
-    }
-    
-    imgFileName := fmt.Sprintf("row%d.png", rowID)
-    file, err := os.Create(filepath.Join(rep.imgDirPath(), imgFileName))
-    if err != nil {
-        return fmt.Errorf("error creating image file: %v", err)
-    }
-    defer file.Close()
-    
-    _, err = io.Copy(file, body)
-    if err != nil {
-        return fmt.Errorf("error copying body to file: %v", err)
-    }
-    return nil
 }

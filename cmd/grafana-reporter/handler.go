@@ -32,7 +32,7 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// ServeReportHandler interface facilitates testsing the reportServing http handler
+// ServeReportHandler interface facilitates testing the reportServing http handler
 type ServeReportHandler struct {
 	newGrafanaClient func(url string, apiToken string, variables url.Values, sslCheck bool, gridLayout bool) grafana.Client
 	newReport        func(g grafana.Client, dashName string, time grafana.TimeRange, texTemplate string, gridLayout bool) report.Report

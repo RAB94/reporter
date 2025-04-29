@@ -32,8 +32,8 @@ var ip = flag.String("ip", "localhost:3000", "Grafana IP and port.")
 var port = flag.String("port", ":8686", "Port to serve on.")
 var templateDir = flag.String("templates", "templates/", "Directory for custom TeX templates.")
 var sslCheck = flag.Bool("ssl-check", true, "Check the SSL issuer and validity. Set this to false if your Grafana serves https using an unverified, self-signed certificate.")
-var gridLayout = flag.Bool("grid-layout", false, "Enable grid layout (-grid-layout=1). Panel width and height will be calculated based off Grafana gridPos width and height.")
-var rowBasedLayout = flag.Bool("row-layout", false, "Enable row-based layout (-row-layout=1). Report will capture entire dashboard rows instead of individual panels.")
+var gridLayout = flag.Bool("grid-layout", false, "Enable grid layout (-grid-layout=1). Panel width and height will be calculated based off Grafana gridPos width and height.")
+var rowLayout = flag.Bool("row-layout", false, "Enable row-based layout (-row-layout=1). Report will capture entire dashboard rows instead of individual panels.")
 
 //cmd line mode params
 var cmdMode = flag.Bool("cmd_enable", false, "Enable command line mode. Generate report from command line without starting webserver (-cmd_enable=1).")
@@ -56,19 +56,33 @@ func main() {
 	} else {
 		log.Printf("SSL check enforced")
 	}
-        if !*gridLayout && !*rowBasedLayout {
-                log.Printf("Using sequential report layout. Consider enabling 'grid-layout' or 'row-layout' so that your report more closely follows the dashboard layout.")
-        } else if *rowBasedLayout {
-                log.Printf("Using row-based layout. Will capture entire rows instead of individual panels.")
-        } else {
-                log.Printf("Using grid layout.")
-        }
+	
+	// Check layout flags and provide appropriate logs
+	if *rowLayout {
+		log.Printf("Using row-based layout. Will capture entire rows in landscape orientation.")
+	} else if *gridLayout {
+		log.Printf("Using grid layout. Panel dimensions will be based on their grid positions.")
+	} else {
+		log.Printf("Using sequential report layout. Consider enabling 'grid-layout' or 'row-layout' so that your report more closely follows the dashboard layout.")
+	}
+	
 	router := mux.NewRouter()
-	RegisterHandlers(
-		router,
-		ServeReportHandler{grafana.NewV4Client, report.New},
-		ServeReportHandler{grafana.NewV5Client, report.New},
-	)
+	// Create custom serve report handlers that pass the layout flags
+	v4Handler := ServeReportHandler{
+		newGrafanaClient: grafana.NewV4Client,
+		newReport: func(g grafana.Client, dashName string, t grafana.TimeRange, texTemplate string, gridLayout bool) report.Report {
+			return report.New(g, dashName, t, texTemplate, *rowLayout)
+		},
+	}
+	
+	v5Handler := ServeReportHandler{
+		newGrafanaClient: grafana.NewV5Client,
+		newReport: func(g grafana.Client, dashName string, t grafana.TimeRange, texTemplate string, gridLayout bool) report.Report {
+			return report.New(g, dashName, t, texTemplate, *rowLayout)
+		},
+	}
+	
+	RegisterHandlers(router, v4Handler, v5Handler)
 
 	if *cmdMode {
 		log.Printf("Called with command line mode enabled, will save report to file and exit.")
@@ -79,6 +93,9 @@ func main() {
 		log.Printf("Called with command line mode 'timeSpan' '%s'", *timeSpan)
 		if template != nil && *template != "" {
 			log.Printf("Called with command line mode 'template' '%s'", *template)
+		}
+		if *rowLayout {
+			log.Printf("Using row-based layout in command line mode")
 		}
 
 		if err := cmdHandler(router); err != nil {

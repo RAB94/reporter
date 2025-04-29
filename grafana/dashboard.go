@@ -18,11 +18,11 @@ package grafana
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/url"
+	"sort"
 	"strings"
-        "fmt"
-        "sort"
 )
 
 type PanelType int
@@ -183,53 +183,55 @@ func sanitizeLaTexInput(input string) string {
 	return input
 }
 
-
 // GetRows returns all rows from the dashboard
 func (dash Dashboard) GetRows() []Row {
-    if len(dash.Rows) > 0 {
-        // V4 Grafana dashboard with explicit rows
-        return dash.Rows
-    } else {
-        // V5+ Grafana dashboard, we need to construct row information from panels
-        return buildRowsFromPanels(dash.Panels)
-    }
+	if len(dash.Rows) > 0 {
+		// V4 Grafana dashboard with explicit rows
+		return dash.Rows
+	} else {
+		// V5+ Grafana dashboard, we need to construct row information from panels
+		return buildRowsFromPanels(dash.Panels)
+	}
 }
 
 // buildRowsFromPanels reconstructs row information from panels in newer Grafana versions
 func buildRowsFromPanels(panels []Panel) []Row {
-    // Group panels by Y coordinate (row position)
-    rowMap := make(map[float64][]Panel)
-    for _, panel := range panels {
-        y := panel.GridPos.Y
-        rowMap[y] = append(rowMap[y], panel)
-    }
-    
-    // Create rows from the grouped panels
-    rows := make([]Row, 0, len(rowMap))
-    for y, panelsInRow := range rowMap {
-        // Sort panels by X coordinate to maintain order
-        sort.Slice(panelsInRow, func(i, j int) bool {
-            return panelsInRow[i].GridPos.X < panelsInRow[j].GridPos.X
-        })
-        
-        // Calculate row title (use first panel's title or a default)
-        title := fmt.Sprintf("Row at position Y=%g", y)
-        if len(panelsInRow) > 0 {
-            title = panelsInRow[0].Title
-        }
-        
-        rows = append(rows, Row{
-            Id:        -1, // We don't have a row ID in v5+
-            Title:     title,
-            Panels:    panelsInRow,
-            Showtitle: false,
-        })
-    }
-    
-    // Sort rows by Y coordinate
-    sort.Slice(rows, func(i, j int) bool {
-        return rows[i].Panels[0].GridPos.Y < rows[j].Panels[0].GridPos.Y
-    })
-    
-    return rows
+	// Group panels by Y coordinate (row position)
+	rowMap := make(map[float64][]Panel)
+	for _, panel := range panels {
+		y := panel.GridPos.Y
+		rowMap[y] = append(rowMap[y], panel)
+	}
+	
+	// Create rows from the grouped panels
+	rows := make([]Row, 0, len(rowMap))
+	for y, panelsInRow := range rowMap {
+		// Sort panels by X coordinate to maintain order
+		sort.Slice(panelsInRow, func(i, j int) bool {
+			return panelsInRow[i].GridPos.X < panelsInRow[j].GridPos.X
+		})
+		
+		// Calculate row title (use first panel's title or a default)
+		title := fmt.Sprintf("Row at position Y=%g", y)
+		if len(panelsInRow) > 0 {
+			title = panelsInRow[0].Title
+		}
+		
+		rows = append(rows, Row{
+			Id:        int(y * 1000), // Generate a unique ID based on Y position
+			Title:     title,
+			Panels:    panelsInRow,
+			Showtitle: false,
+		})
+	}
+	
+	// Sort rows by Y coordinate
+	sort.Slice(rows, func(i, j int) bool {
+		if len(rows[i].Panels) == 0 || len(rows[j].Panels) == 0 {
+			return i < j // Fallback for empty rows
+		}
+		return rows[i].Panels[0].GridPos.Y < rows[j].Panels[0].GridPos.Y
+	})
+	
+	return rows
 }

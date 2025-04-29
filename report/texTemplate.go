@@ -42,26 +42,44 @@ const defaultTemplate = `
 \end{document}
 `
 
-
+// Row-based template with landscape orientation
 const rowBasedTemplate = `
 %use square brackets as golang text templating delimiters
-\documentclass{article}
+\documentclass[landscape]{article}
+\usepackage[utf8]{inputenc}
 \usepackage{graphicx}
-\usepackage[margin=1in]{geometry}
+\usepackage[paperwidth=11in,paperheight=8.5in,margin=0.5in]{geometry}
+\usepackage{amsmath}
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+
+% Footer configuration
+\fancyfoot[L]{[[.Title]]}
+\fancyfoot[C]{Splitpoint Solutions}
+\fancyfoot[R]{Page \thepage}
+
+% Set header height appropriately
+\setlength\headheight{80pt}
+
+% Header configuration - adjust width for landscape mode
+\lhead{\includegraphics[width=0.9\paperwidth,height=2cm]{/home/sps/reporter-images-DO-NOT-DELETE/REPORT-HEADER-05.png}}
 
 \graphicspath{ {images/} }
 \begin{document}
 \title{[[.Title]] [[if .VariableValues]] \\ \large [[.VariableValues]] [[end]] [[if .Description]] \\ \small [[.Description]] [[end]]}
 \date{[[.FromFormatted]]\\to\\[[.ToFormatted]]}
 \maketitle
+\thispagestyle{fancy}
+
+% Display dashboard rows one per page
+[[range .GetRows]]
+\newpage
+\thispagestyle{fancy}
+\vspace*{0.5cm}
 \begin{center}
-[[range .Rows]]
-\vspace{0.5cm}
-\includegraphics[width=\textwidth]{row[[.Id]]}
-\par
-\vspace{0.5cm}
+\includegraphics[width=0.95\paperwidth,height=0.7\paperheight,keepaspectratio]{row[[.Id]]}
+\end{center}
 [[end]]
 
-\end{center}
 \end{document}
 `
