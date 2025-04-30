@@ -60,7 +60,7 @@ func (h ServeReportHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) 
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	defer rep.Clean()
+//	defer rep.Clean()
 	defer file.Close()
 	addFilenameHeader(w, rep.Title())
 

@@ -17,14 +17,14 @@
 package grafana
 
 import (
-	"encoding/json"
-	"fmt"
+	"encoding/json" // Keep for unmarshaling panel/row JSON if needed later
 	"log"
 	"net/url"
 	"sort"
-	"strings"
+	"strings" // Keep for getVariablesValues and sanitizeLaTexInput
 )
 
+// --- Panel Type Enum (Keep as is) ---
 type PanelType int
 
 const (
@@ -32,6 +32,7 @@ const (
 	Text
 	Graph
 	Table
+	Row // Keep Row type for identification
 )
 
 func (p PanelType) string() string {
@@ -40,18 +41,95 @@ func (p PanelType) string() string {
 		"text",
 		"graph",
 		"table",
+		"row", // Added "row" representation
 	}[p]
 }
 
-// Panel represents a Grafana dashboard panel
-type Panel struct {
-	Id      int
-	Type    string
-	Title   string
-	GridPos GridPos
+// --- Struct Definitions ---
+
+// FullDashboard represents the entire JSON structure returned by the Grafana API
+// It includes metadata and the main dashboard definition.
+type FullDashboard struct {
+	Meta      DashboardMeta `json:"meta"`
+	Dashboard Dashboard     `json:"dashboard"`
 }
 
-// Panel represents a Grafana dashboard panel position
+// DashboardMeta contains metadata about the dashboard. Add fields as needed.
+type DashboardMeta struct {
+	Slug    string `json:"slug"`
+	Version int    `json:"version"`
+	// Add other meta fields if required (e.g., FolderId, FolderTitle)
+}
+
+// Dashboard represents the main dashboard structure.
+type Dashboard struct {
+	Title       string            `json:"title"`
+	Description string            `json:"description"` // Added Description field
+	Uid         string            `json:"uid"`
+	Time        Time              `json:"time"`
+	Templating  Templating        `json:"templating"`
+	Timezone    string            `json:"timezone"`
+	Rows        []json.RawMessage `json:"rows"`   // Deprecated in Grafana v5+, use Panels directly
+	Panels      []json.RawMessage `json:"panels"` // Grafana v5+ stores panels here, including rows
+	// Internal fields to store processed panels/rows
+	processedPanels []Panel
+	processedRows   []GrafanaRow
+}
+
+// Time represents the dashboard's default time range
+type Time struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// Templating holds information about dashboard variables
+type Templating struct {
+	List []TemplateVariable `json:"list"`
+}
+
+// TemplateVariable represents a single dashboard variable
+type TemplateVariable struct {
+	Name       string      `json:"name"`
+	Label      string      `json:"label"`    // Display name
+	Type       string      `json:"type"`     // e.g., query, custom, interval
+	Current    CurrentVal  `json:"current"`  // Selected value(s)
+	Options    []OptionVal `json:"options"`  // Available options
+	Multi      bool        `json:"multi"`    // Allow multiple selections?
+	IncludeAll bool        `json:"includeAll"`// Has 'All' option?
+	Hide       int         `json:"hide"`     // 0=visible, 1=label only, 2=hidden
+	// Add other fields like 'query', 'datasource' if needed
+}
+
+// CurrentVal holds the currently selected value(s) for a template variable
+type CurrentVal struct {
+	Text  interface{} `json:"text"`  // Can be string or []string/[]interface{}
+	Value string      `json:"value"` // Can be string or JSON array string '["val1","val2"]'
+	// Add 'tags' or other fields if necessary
+}
+
+// OptionVal represents one available option for a template variable
+type OptionVal struct {
+	Text     string `json:"text"`
+	Value    string `json:"value"`
+	Selected bool   `json:"selected"`
+}
+
+// Panel represents common fields for Grafana panels (including rows)
+type Panel struct {
+	Id      int     `json:"id"`
+	Type    string  `json:"type"` // "row", "graph", "singlestat", etc.
+	Title   string  `json:"title"`
+	GridPos GridPos `json:"gridPos"`
+
+	// Fields specific to 'row' type panels:
+	Collapsed bool              `json:"collapsed,omitempty"`
+	Panels    []json.RawMessage `json:"panels,omitempty"` // Nested panels within a row
+
+	// Internal cache for panels contained within this row panel
+	ContentPanels []Panel `json:"-"` // Use json:"-" to prevent marshalling loops
+}
+
+// GridPos represents position and size in the Grafana grid
 type GridPos struct {
 	H float64 `json:"h"`
 	W float64 `json:"w"`
@@ -59,80 +137,126 @@ type GridPos struct {
 	Y float64 `json:"y"`
 }
 
-// Row represents a container for Panels
-type Row struct {
-	Id        int
-	Showtitle bool
-	Title     string
-	Panels    []Panel
+// GrafanaRow represents a structured row, processed from Panel data
+type GrafanaRow struct {
+	Id            int
+	Title         string
+	Showtitle     bool // True if the row title should be displayed
+	ContentPanels []Panel
+	GridPos       GridPos // Position of the row itself
 }
 
-// Dashboard represents a Grafana dashboard
-// This is both used to unmarshal the dashbaord JSON into
-// and then enriched (sanitize fields for TeX consumption and add VarialbeValues)
-type Dashboard struct {
-	Title          string
-	Description    string
-	VariableValues string //Not present in the Grafana JSON structure. Enriched data passed used by the Tex templating
-	Rows           []Row
-	Panels         []Panel
-}
+// --- Helper Functions ---
 
-type dashContainer struct {
-	Dashboard Dashboard
-	Meta      struct {
-		Slug string
-	}
-}
-
-// NewDashboard creates Dashboard from Grafana's internal JSON dashboard definition
-func NewDashboard(dashJSON []byte, variables url.Values) Dashboard {
-	var dash dashContainer
-	err := json.Unmarshal(dashJSON, &dash)
-	if err != nil {
-		panic(err)
-	}
-	d := dash.NewDashboard(variables)
-	log.Printf("Populated dashboard datastructure: %+v\n", d)
-	return d
-}
-
-func (dc dashContainer) NewDashboard(variables url.Values) Dashboard {
-	var dash Dashboard
-	dash.Title = sanitizeLaTexInput(dc.Dashboard.Title)
-	dash.Description = sanitizeLaTexInput(dc.Dashboard.Description)
-	dash.VariableValues = sanitizeLaTexInput(getVariablesValues(variables))
-
-	if len(dc.Dashboard.Rows) == 0 {
-		return populatePanelsFromV5JSON(dash, dc)
-	}
-	return populatePanelsFromV4JSON(dash, dc)
-}
-
-func populatePanelsFromV4JSON(dash Dashboard, dc dashContainer) Dashboard {
-	for _, row := range dc.Dashboard.Rows {
-		row.Title = sanitizeLaTexInput(row.Title)
-		for i, p := range row.Panels {
-			p.Title = sanitizeLaTexInput(p.Title)
-			row.Panels[i] = p
-			dash.Panels = append(dash.Panels, p)
-		}
-		dash.Rows = append(dash.Rows, row)
+// processPanelsAndRows extracts Panels and Rows from the raw JSON messages
+// This should be called after unmarshaling into FullDashboard
+func (d *Dashboard) processPanelsAndRows() {
+	if d.processedPanels != nil || d.processedRows != nil {
+		return // Already processed
 	}
 
-	return dash
-}
+	var allPanels []Panel
+	panelSource := d.Panels // Use Panels field (Grafana v5+)
 
-func populatePanelsFromV5JSON(dash Dashboard, dc dashContainer) Dashboard {
-	for _, p := range dc.Dashboard.Panels {
-		if p.Type == "row" {
+	// Fallback to Rows field if Panels is empty (older Grafana versions)
+	if len(panelSource) == 0 && len(d.Rows) > 0 {
+		log.Println("Using deprecated 'rows' field for panel data.")
+		panelSource = d.Rows
+	}
+
+	log.Printf("Processing %d raw panel/row entries...", len(panelSource))
+	currentY := -1.0 // Track Y coordinate to group panels into implicit rows if needed
+	var currentRowPanels []Panel
+	var explicitRows []GrafanaRow
+
+	for _, raw := range panelSource {
+		var p Panel
+		err := json.Unmarshal(raw, &p)
+		if err != nil {
+			log.Printf("Warning: Skipping panel/row - Error unmarshaling panel JSON: %v. JSON: %s", err, limitString(string(raw), 100))
 			continue
 		}
-		p.Title = sanitizeLaTexInput(p.Title)
-		dash.Panels = append(dash.Panels, p)
+
+		if p.Type == "row" {
+			log.Printf("Processing Row: %s (ID: %d)", p.Title, p.Id)
+			// Process nested panels within the row
+			var nestedPanels []Panel
+			for _, nestedRaw := range p.Panels {
+				var nestedP Panel
+				err := json.Unmarshal(nestedRaw, &nestedP)
+				if err != nil {
+					log.Printf("Warning: Skipping nested panel in row %d - Error unmarshaling: %v. JSON: %s", p.Id, err, limitString(string(nestedRaw), 100))
+					continue
+				}
+				// Assign Y coordinate relative to row if needed, though GridPos usually handles it
+				nestedPanels = append(nestedPanels, nestedP)
+				allPanels = append(allPanels, nestedP) // Also add to the flat list
+			}
+			p.ContentPanels = nestedPanels // Store processed nested panels internally
+
+			// Create a structured GrafanaRow
+			explicitRows = append(explicitRows, GrafanaRow{
+				Id:            p.Id,
+				Title:         p.Title,
+				Showtitle:     !p.Collapsed, // Consider collapsed rows as not showing title prominently
+				ContentPanels: nestedPanels,
+				GridPos:       p.GridPos,
+			})
+		} else {
+			// Regular panel
+			allPanels = append(allPanels, p)
+
+			// Group panels by Y coordinate for implicit row generation if needed (less common now)
+			if int(p.GridPos.Y) != int(currentY) {
+				// Start of a new potential implicit row
+				currentY = p.GridPos.Y
+				currentRowPanels = []Panel{}
+			}
+			currentRowPanels = append(currentRowPanels, p)
+		}
 	}
-	return dash
+
+	// Sort panels and rows primarily by Y coordinate, then X
+	sort.SliceStable(allPanels, func(i, j int) bool {
+		if allPanels[i].GridPos.Y != allPanels[j].GridPos.Y {
+			return allPanels[i].GridPos.Y < allPanels[j].GridPos.Y
+		}
+		return allPanels[i].GridPos.X < allPanels[j].GridPos.X
+	})
+	sort.SliceStable(explicitRows, func(i, j int) bool {
+		// Use row's GridPos.Y for sorting
+		if explicitRows[i].GridPos.Y != explicitRows[j].GridPos.Y {
+			return explicitRows[i].GridPos.Y < explicitRows[j].GridPos.Y
+		}
+		return explicitRows[i].GridPos.X < explicitRows[j].GridPos.X
+	})
+
+	d.processedPanels = allPanels
+	d.processedRows = explicitRows // Store the processed rows
+	log.Printf("Finished processing: %d panels, %d explicit rows identified.", len(d.processedPanels), len(d.processedRows))
 }
+
+// GetGridPanels returns panels suitable for grid layout (non-row panels)
+// It ensures panels are processed first.
+func (d *Dashboard) GetGridPanels() []Panel {
+	d.processPanelsAndRows() // Ensure data is processed
+	var gridPanels []Panel
+	for _, p := range d.processedPanels {
+		if p.Type != "row" { // Exclude panels that are actually row definitions
+			gridPanels = append(gridPanels, p)
+		}
+	}
+	return gridPanels
+}
+
+// GetRows returns processed rows suitable for row layout.
+// It ensures panels/rows are processed first.
+func (d *Dashboard) GetRows() []GrafanaRow {
+	d.processPanelsAndRows() // Ensure data is processed
+	return d.processedRows
+}
+
+// --- Methods for Panel and GrafanaRow (Keep existing ones) ---
 
 func (p Panel) IsSingleStat() bool {
 	return p.Is(SingleStat)
@@ -157,9 +281,12 @@ func (p Panel) Is(t PanelType) bool {
 	return false
 }
 
-func (r Row) IsVisible() bool {
+func (r GrafanaRow) IsVisible() bool {
+	// Use Showtitle which is determined during processing
 	return r.Showtitle
 }
+
+// --- Standalone Utility Functions (Keep as is) ---
 
 func getVariablesValues(variables url.Values) string {
 	values := []string{}
@@ -169,69 +296,34 @@ func getVariablesValues(variables url.Values) string {
 	return strings.Join(values, ", ")
 }
 
-func sanitizeLaTexInput(input string) string {
-	input = strings.Replace(input, "\\", "\\textbackslash ", -1)
-	input = strings.Replace(input, "&", "\\&", -1)
-	input = strings.Replace(input, "%", "\\%", -1)
-	input = strings.Replace(input, "$", "\\$", -1)
-	input = strings.Replace(input, "#", "\\#", -1)
-	input = strings.Replace(input, "_", "\\_", -1)
-	input = strings.Replace(input, "{", "\\{", -1)
-	input = strings.Replace(input, "}", "\\}", -1)
-	input = strings.Replace(input, "~", "\\textasciitilde ", -1)
-	input = strings.Replace(input, "^", "\\textasciicircum ", -1)
+// SanitizeLaTexInput escapes characters problematic for LaTeX
+func SanitizeLaTexInput(input string) string {
+	// Use a temporary placeholder for backslashes to avoid double escaping
+	placeholder := "___TEMP_BACKSLASH___"
+	input = strings.ReplaceAll(input, "\\", placeholder)
+
+	// Escape other special characters
+	input = strings.ReplaceAll(input, "&", "\\&")
+	input = strings.ReplaceAll(input, "%", "\\%")
+	input = strings.ReplaceAll(input, "$", "\\$")
+	input = strings.ReplaceAll(input, "#", "\\#")
+	input = strings.ReplaceAll(input, "_", "\\_")
+	input = strings.ReplaceAll(input, "{", "\\{")
+	input = strings.ReplaceAll(input, "}", "\\}")
+	input = strings.ReplaceAll(input, "~", "\\textasciitilde{}") // Requires textcomp package? Or use verb
+	input = strings.ReplaceAll(input, "^", "\\textasciicircum{}") // Requires textcomp package? Or use verb
+
+	// Replace the placeholder with the LaTeX command for backslash
+	// Ensure space after command if needed depending on context, but usually safe this way
+	input = strings.ReplaceAll(input, placeholder, "\\textbackslash{}")
+
 	return input
 }
 
-// GetRows returns all rows from the dashboard
-func (dash Dashboard) GetRows() []Row {
-	if len(dash.Rows) > 0 {
-		// V4 Grafana dashboard with explicit rows
-		return dash.Rows
-	} else {
-		// V5+ Grafana dashboard, we need to construct row information from panels
-		return buildRowsFromPanels(dash.Panels)
-	}
-}
-
-// buildRowsFromPanels reconstructs row information from panels in newer Grafana versions
-func buildRowsFromPanels(panels []Panel) []Row {
-	// Group panels by Y coordinate (row position)
-	rowMap := make(map[float64][]Panel)
-	for _, panel := range panels {
-		y := panel.GridPos.Y
-		rowMap[y] = append(rowMap[y], panel)
-	}
-	
-	// Create rows from the grouped panels
-	rows := make([]Row, 0, len(rowMap))
-	for y, panelsInRow := range rowMap {
-		// Sort panels by X coordinate to maintain order
-		sort.Slice(panelsInRow, func(i, j int) bool {
-			return panelsInRow[i].GridPos.X < panelsInRow[j].GridPos.X
-		})
-		
-		// Calculate row title (use first panel's title or a default)
-		title := fmt.Sprintf("Row at position Y=%g", y)
-		if len(panelsInRow) > 0 {
-			title = panelsInRow[0].Title
-		}
-		
-		rows = append(rows, Row{
-			Id:        int(y * 1000), // Generate a unique ID based on Y position
-			Title:     title,
-			Panels:    panelsInRow,
-			Showtitle: false,
-		})
-	}
-	
-	// Sort rows by Y coordinate
-	sort.Slice(rows, func(i, j int) bool {
-		if len(rows[i].Panels) == 0 || len(rows[j].Panels) == 0 {
-			return i < j // Fallback for empty rows
-		}
-		return rows[i].Panels[0].GridPos.Y < rows[j].Panels[0].GridPos.Y
-	})
-	
-	return rows
-}
+// Helper to limit string length for logging (already defined in api.go, but keep here for potential use within package)
+// func limitString(s string, maxLen int) string {
+// 	if len(s) <= maxLen {
+// 		return s
+// 	}
+// 	return s[:maxLen] + "..."
+// }
